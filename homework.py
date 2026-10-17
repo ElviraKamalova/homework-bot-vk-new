@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from exceptions import (
     APIResponseError,
     JSONParsingError,
-    PractikumAPIError
+    PractikumAPIError,
 )
 
 
@@ -21,7 +21,8 @@ PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
 VK_USER_ID = os.getenv('VK_USER_ID')
 
-RETRY_PERIOD = 600
+RETRY_PERIOD_IN_SECONDS = 600
+RETRY_PERIOD = RETRY_PERIOD_IN_SECONDS
 ENDPOINT = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
 HEADERS = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
 
@@ -34,12 +35,13 @@ HOMEWORK_VERDICTS = {
 
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
+    format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+    handlers=(
         logging.FileHandler('bot_debug.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(sys.stdout)
+    )
 )
+logger = logging.getLogger(__name__)
 
 
 def check_tokens():
@@ -50,21 +52,22 @@ def check_tokens():
         'VK_USER_ID': VK_USER_ID
     }
     missing = [
-        name for name, val in required_tokens.items()
-        if not val or not str(val).strip()
+        name for name, token_value in required_tokens.items()
+        if not token_value or not str(token_value).strip()
     ]
 
     if missing:
-        logging.critical(
+        missing_tokens_str = ','.join(missing)
+        logger.critical(
             f'Ошибка конфигурации! Не найдены следующие токены: '
-            f'{",".join(missing)}'
+            f'{missing_tokens_str}'
         )
         return False
 
     try:
         int(VK_USER_ID)
     except (TypeError, ValueError):
-        logging.critical('Ошибка конфигурации! VK_USER_ID должен быть числом.')
+        logger.exception('Ошибка конфигурации! VK_USER_ID должен быть числом.')
         return False
 
     return True
@@ -72,31 +75,44 @@ def check_tokens():
 
 def send_message(vk, message):
     """Отправляет сообщение пользователю через VK API."""
+    user_id = int(VK_USER_ID)
+    random_id = int(time.time())
+
     try:
         vk.messages.send(
-            user_id=int(VK_USER_ID),
+            user_id=user_id,
             message=message,
-            random_id=int(time.time())
+            random_id=random_id
         )
-        logging.debug(f'Сообщение успешно отправлено в VK: {message}')
-    except Exception as error:
-        logging.error(f"Ошибка отправки: {error}")
+    except vk_api.VkApiError as error:
+        logger.error(f'Ошибка отправки: {error}')
+        return False
+    else:
+        logger.debug(f'Сообщение успешно отправлено в VK: {message}')
+        return True
 
 
 def get_api_answer(timestamp):
     """Делает запрос к API.
+
     Возвращает ответ, приведенный к типам данных Python.
     """
     payload = {'from_date': timestamp}
     try:
         response = requests.get(ENDPOINT, headers=HEADERS, params=payload)
-        if response.status_code != 200:
+        if response.status_code != requests.codes.ok:
+            response_text = response.text
             raise APIResponseError(
-                f'Эндпоинт вернул код {response.status_code}'
+                f'Эндпоинт вернул код {response.status_code}\n'
+                f'Адрес запроса: {ENDPOINT}\n'
+                f'Параметры: {payload}\n'
+                f'Тело ответа: {response_text}'
             )
         return response.json()
     except requests.RequestException as error:
-        raise PractikumAPIError(f'Ошибка при запросе к API: {error}')
+        raise PractikumAPIError(
+            f'Ошибка при запросе к API: {error}'
+        ) from error
     except ValueError as error:
         raise JSONParsingError(
             f'Ответ от API не удалось преобразовать в JSON: {error}'
@@ -106,7 +122,10 @@ def get_api_answer(timestamp):
 def check_response(response):
     """Проверяет ответ API на соответствие документации."""
     if not isinstance(response, dict):
-        raise TypeError('Ответ API не является словарем')
+        actual_type = type(response)
+        raise TypeError(
+            f'Ответ API не является словарем! '
+            f'Ожидался тип dict, но получен тип: {actual_type}')
 
     if 'homeworks' not in response:
         raise KeyError('В ответе отсутствует ключ "homeworks"')
@@ -114,9 +133,13 @@ def check_response(response):
     if 'current_date' not in response:
         raise KeyError('В ответе отсутствует ключ "current_date"')
 
-    homeworks = response.get('homeworks')
+    homeworks = response['homeworks']
     if not isinstance(homeworks, list):
-        raise TypeError('Значение под ключом "homeworks" не является списком')
+        actual_type = type(homeworks)
+        raise TypeError(
+            f'Значение под ключом "homeworks" не является списком!'
+            f'Ожидался тип list, но получен: {actual_type}'
+        )
 
     return homeworks
 
@@ -145,30 +168,32 @@ def main():
         vk_session = vk_api.VkApi(token=VK_TOKEN)
         vk = vk_session.get_api()
     except Exception as error:
-        logging.critical(f'Не удалось подключиться к VK API: {error}')
+        logger.critical(f'Не удалось подключиться к VK API: {error}')
         sys.exit(1)
 
     timestamp = int(time.time()) - 30 * 24 * 60 * 60
     last_error = ''
     while True:
         try:
-            response = get_api_answer(timestamp)
-            homeworks = check_response(response)
-            if homeworks:
-                message = parse_status(homeworks[0])
+            response_data = get_api_answer(timestamp)
+            homeworks = check_response(response_data)
+            if not homeworks:
+                logger.debug('В ответе отсутствуют статусы домашних работ')
+                timestamp = response_data.get('current_date', timestamp)
+                continue
+            for homework in homeworks:
+                message = parse_status(homework)
                 send_message(vk, message)
-            else:
-                logging.debug('В ответе отсутствуют статусы домашних работ')
 
-            timestamp = response.get('current_date', timestamp)
+            timestamp = response_data.get('current_date', timestamp)
             last_error = ''
 
         except Exception as error:
             message = f'Сбой в работе программы: {error}'
-            logging.error(message)
-            if message != last_error:
-                send_message(vk, message)
+            logger.error(message)
+            if message != last_error and send_message(vk, message):
                 last_error = message
+
         finally:
             time.sleep(RETRY_PERIOD)
 
